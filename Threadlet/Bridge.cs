@@ -20,16 +20,19 @@ public sealed class Bridge : IDisposable
         {
             if (!response.IsSuccessStatusCode) throw new InvalidOperationException($"Server returned {(int)response.StatusCode}. Check your connection, password, and server configuration.");
             using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+            if (doc.RootElement.TryGetProperty("status", out var status) && status.TryGetInt32(out var code) && code >= 400) throw new InvalidOperationException("BlueBubbles rejected the request. Check server support and message eligibility.");
             return doc.RootElement.TryGetProperty("data", out var data) ? data.Clone() : doc.RootElement.Clone();
         }
     }
     public async Task<JsonElement> Post(string path, object body) => await Read(await client.PostAsJsonAsync(Url(path), body));
     public async Task<JsonElement> Contacts() => await Read(await client.GetAsync(Url("contact")));
+    public async Task<JsonElement> ServerInfo() => await Read(await client.GetAsync(Url("server/info")));
+    public async Task Unsend(string guid) => await Post("message/" + Uri.EscapeDataString(guid) + "/unsend", new { partIndex = 0 });
     public async Task Ping() => await Read(await client.GetAsync(Url("ping")));
-    public async Task<JsonElement> Chats() => await Post("chat/query", new { limit = 100, offset = 0, with = new[] { "participants", "lastMessage" }, sort = "lastmessage" });
-    public async Task<JsonElement> Messages(string guid, int offset = 0) => await Post("message/query", new { chatGuid = guid, limit = 100, offset, sort = "DESC", with = new[] { "handle", "attachment" } });
-    public async Task Send(string guid, string text) => await Post("message/text", new { chatGuid = guid, message = text, tempGuid = Guid.NewGuid().ToString(), method = "private-api" });
-    public async Task NewChat(string[] addresses, string text) => await Post("chat/new", new { addresses, message = text, method = "private-api" });
+    public async Task<JsonElement> Chats() => await Post("chat/query", new { limit = 100, offset = 0, with = new[] { "participants", "lastmessage" }, sort = "lastmessage" });
+    public async Task<JsonElement> Messages(string guid, int offset = 0) => await Post("message/query", new { chatGuid = guid, limit = 100, offset, sort = "DESC", with = new[] { "chat", "attachment", "attributed-body", "message-summary-info" } });
+    public async Task<JsonElement> Send(string guid, string text) => await Post("message/text", new { chatGuid = guid, message = text, tempGuid = Guid.NewGuid().ToString(), method = "private-api" });
+    public async Task NewChat(string[] addresses, string text) => await Post("chat/new", new { addresses, message = text, service = "iMessage", method = "private-api" });
     public async Task Upload(string guid, string path)
     {
         using var form = new MultipartFormDataContent();
@@ -41,12 +44,18 @@ public sealed class Bridge : IDisposable
     }
     public async Task Download(string guid, string path)
     {
-        using var response = await client.GetAsync(Url("attachment/" + Uri.EscapeDataString(guid) + "/download?original=true"));
+        using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+        using var response = await client.GetAsync(Url("attachment/" + Uri.EscapeDataString(guid) + "/download?original=true"), HttpCompletionOption.ResponseHeadersRead, timeout.Token);
         if (!response.IsSuccessStatusCode) throw new InvalidOperationException("The attachment could not be downloaded.");
-        await using var output = File.Create(path);
-        await response.Content.CopyToAsync(output);
+        var temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        try
+        {
+            await using (var output = File.Create(temporary)) await response.Content.CopyToAsync(output, timeout.Token);
+            File.Move(temporary, path, true);
+        }
+        finally { if (File.Exists(temporary)) File.Delete(temporary); }
     }
-        public async Task<byte[]> Preview(string guid, bool large = false)
+    public async Task<byte[]> Preview(string guid, bool large = false)
     {
         using var response = await client.GetAsync(Url("attachment/" + Uri.EscapeDataString(guid) + (large ? "/download?original=false&width=2048&quality=best" : "/download?original=false&width=640&quality=good")), HttpCompletionOption.ResponseHeadersRead);
         if (!response.IsSuccessStatusCode) throw new InvalidOperationException("Preview unavailable");
@@ -66,6 +75,11 @@ public sealed class Bridge : IDisposable
 }
 public static class Json
 {
+    public static JsonElement LastMessage(this JsonElement value)
+    {
+        var last = value.Part("lastMessage");
+        return last.ValueKind == JsonValueKind.Object ? last : value.Part("messages").Rows().OrderByDescending(m => long.TryParse(m.Text("dateCreated"), out var stamp) ? stamp : 0).FirstOrDefault();
+    }
     public static string Text(this JsonElement value, string key, string fallback = "") => value.ValueKind == JsonValueKind.Object && value.TryGetProperty(key, out var item) && item.ValueKind != JsonValueKind.Null ? item.ToString() : fallback;
     public static JsonElement Part(this JsonElement value, string key) => value.ValueKind == JsonValueKind.Object && value.TryGetProperty(key, out var item) ? item : default;
     public static IEnumerable<JsonElement> Rows(this JsonElement value) => value.ValueKind == JsonValueKind.Array ? value.EnumerateArray().ToArray() : Array.Empty<JsonElement>();

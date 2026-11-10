@@ -9,8 +9,10 @@ using System.Windows.Media;
 using System.Windows.Threading;
 using Microsoft.Win32;
 namespace Threadlet;
-public record Conversation(string Guid, string Name, string Preview, bool Muted = false, bool Pinned = false)
+public record Conversation(string Guid, string Name, string Preview, bool Muted = false, bool Pinned = false, bool Unread = false, string Service = "iMessage")
 {
+    public string ReadLabel => Unread ? "Mark as Read" : "Mark as Unread";
+    public string UnreadDot => Unread ? "\u25CF" : "";
     public string MuteLabel => Muted ? "Show Alerts" : "Hide Alerts";
     public string PinLabel => Pinned ? "Unpin" : "Pin";
     public string Indicators => (Pinned ? "Pinned  " : "") + (Muted ? "Alerts hidden" : "");
@@ -18,18 +20,25 @@ public record Conversation(string Guid, string Name, string Preview, bool Muted 
 }
 public record Attachment(string Guid, string Name, string Mime = "")
 {
-    public bool IsImage => Mime.StartsWith("image/", StringComparison.OrdinalIgnoreCase) || new[] { ".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif" }.Contains(Path.GetExtension(Name).ToLowerInvariant());
+    public bool IsImage => Mime.StartsWith("image/", StringComparison.OrdinalIgnoreCase) || new[] { ".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif", ".bmp", ".tif", ".tiff", ".jfif" }.Contains(Path.GetExtension(Name).ToLowerInvariant());
 }
 public record Message(string Text, string Sender, string Time, bool Mine, List<Attachment> Attachments)
 {
+    public string Id { get; init; } = Guid.NewGuid().ToString();
+    public long Created { get; init; }
+    public string Service { get; init; } = "iMessage";
+    public bool Sent { get; init; }
+    public bool Retracted { get; init; }
+    public bool SimplePart { get; init; } = true;
     public string Receipt { get; init; } = "";
     public HorizontalAlignment Alignment => Mine ? HorizontalAlignment.Right : HorizontalAlignment.Left;
-    public Brush Bubble => new SolidColorBrush((Color)ColorConverter.ConvertFromString(Mine ? "#007AFF" : "#2B3044"));
+    public Brush Bubble => new SolidColorBrush((Color)ColorConverter.ConvertFromString(!Mine ? "#303033" : Service.Equals("iMessage", StringComparison.OrdinalIgnoreCase) ? "#0A84FF" : new[] { "SMS", "MMS", "RCS" }.Contains(Service.ToUpperInvariant()) ? "#248A3D" : "#48484A"));
 }
 public partial class MainWindow : Window
 {
         readonly Dictionary<string, (string Text, string? File)> drafts = new();
     string? activeChat;
+    readonly Dictionary<string, string> contactAddresses = new(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<string, string> contactNames = new(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<string, System.Windows.Media.Imaging.BitmapImage> previews = new();
     readonly SemaphoreSlim previewGate = new(3);
@@ -41,7 +50,7 @@ public partial class MainWindow : Window
     readonly DispatcherTimer timer = new() { Interval = TimeSpan.FromSeconds(5) };
     readonly DesktopNotifications notifications = new();
     readonly Dictionary<string, string> notificationBaseline = new();
-    readonly Preferences preferences = Preferences.Load();
+    readonly Preferences preferences;
     bool notificationReady;
     bool notificationsEnabled { get => preferences.Notifications; set { preferences.Notifications = value; SavePreferences(); } }
     bool notificationPreviews { get => preferences.NotificationPreviews; set { preferences.NotificationPreviews = value; SavePreferences(); } }
@@ -51,12 +60,23 @@ public partial class MainWindow : Window
     int generation;
 
 
+    bool updatingList, unreadOnly, supportsUnsend, privateApiReady, vmStarting;
+    int serverMacMajor;
+    DateTimeOffset capabilitiesChecked;
+    readonly Dictionary<string, string> latestTokens = new();
+    readonly HashSet<string> locallyUnsent = new();
+    readonly HashSet<string> confirmedSent = new();
     string serverUrl = "http://localhost:1234";
-    public MainWindow()
+    public MainWindow() : this(Preferences.Load()) { }
+    public MainWindow(Preferences settings)
     {
+        preferences = settings;
         InitializeComponent();
         Search.ToolTip = "Search conversations";
         LoadDemo();
+        Loaded += async (_, _) => { MarkViewed(); await StartVm(); };
+        Activated += (_, _) => MarkViewed();
+        MessageScroll.ScrollChanged += (_, _) => MarkViewed();
 
 
         AllowDrop = true;
@@ -71,29 +91,48 @@ public partial class MainWindow : Window
         demo["demo-friends"] = new() { new("Anyone up for a little escape this weekend?", "Maya", "10:24 AM", false, new()), new("Absolutely. Coffee first, adventure second?", "You", "10:25 AM", true, new()), new("Saturday sounds perfect.", "Maya", "10:26 AM", false, new()) };
         demo["demo-jamie"] = new() { new("Did you get a chance to see it?", "Jamie", "Yesterday", false, new()) };
         demo["demo-alex"] = new() { new("Thanks! Catch you tomorrow.", "Alex", "Yesterday", false, new()) };
+        foreach (var chat in conversations) latestTokens[chat.Guid] = "demo-" + demo[chat.Guid].Count;
+        for (int i = 0; i < conversations.Count; i++) { var c = conversations[i]; conversations[i] = c with { Unread = preferences.ForcedUnread.Contains(c.Guid) || preferences.SeenMessages.GetValueOrDefault(c.Guid) != latestTokens[c.Guid], Muted = preferences.Muted.Contains(c.Guid), Pinned = preferences.Pinned.Contains(c.Guid) }; }
         Filter(); Chats.SelectedIndex = 0;
     }
+    List<Conversation> VisibleChats() => conversations.Where(c => (!unreadOnly || c.Unread) && (c.Name.Contains(Search.Text, StringComparison.OrdinalIgnoreCase) || c.Preview.Contains(Search.Text, StringComparison.OrdinalIgnoreCase))).OrderByDescending(c => preferences.Pinned.Contains(c.Guid)).ToList();
     void Filter()
     {
         var selected = (Chats.SelectedItem as Conversation)?.Guid;
-        Chats.ItemsSource = conversations.Where(c => c.Name.Contains(Search.Text, StringComparison.OrdinalIgnoreCase) || c.Preview.Contains(Search.Text, StringComparison.OrdinalIgnoreCase)).OrderByDescending(c => preferences.Pinned.Contains(c.Guid)).ToList();
-        if (selected != null) Chats.SelectedItem = Chats.Items.Cast<Conversation>().FirstOrDefault(c => c.Guid == selected);
+        updatingList = true;
+        try { Chats.ItemsSource = VisibleChats(); Chats.SelectedItem = Chats.Items.Cast<Conversation>().FirstOrDefault(c => c.Guid == selected); }
+        finally { updatingList = false; }
+        PinnedChats.ItemsSource = conversations.Where(c => c.Pinned).Take(9).ToList();
+        var count = conversations.Count(c => c.Unread); UnreadCount.Text = count == 0 ? "" : count.ToString();
+        Title = count == 0 ? "Threadlet" : $"Threadlet ({count})";
+        if (selected != null && Chats.SelectedItem == null) { activeChat = null; Messages.ItemsSource = null; ChatTitle.Text = "Messages"; ChatSubtitle.Text = "Choose a conversation"; }
     }
-    void Search_Changed(object sender, TextChangedEventArgs e) { if (Chats != null) Filter(); }
+    void Search_Changed(object sender, TextChangedEventArgs e) { if (Chats != null && PinnedChats != null) Filter(); }
+    void Filter_Click(object sender, RoutedEventArgs e) { if (sending) return; unreadOnly = !unreadOnly; FilterButton.Content = unreadOnly ? "Unread" : "All Messages"; Filter(); }
+    void Pinned_Click(object sender, RoutedEventArgs e)
+    {
+        if (sending || (sender as Button)?.Tag is not string guid) return;
+        unreadOnly = false; FilterButton.Content = "All Messages"; Search.Clear(); Filter();
+        Chats.SelectedItem = Chats.Items.Cast<Conversation>().FirstOrDefault(c => c.Guid == guid);
+    }
     async void Chat_Selected(object sender, SelectionChangedEventArgs e)
     {
+        if (updatingList) return;
         generation++;
         if (activeChat != null) drafts[activeChat] = (Composer.Text, file);
         activeChat = (Chats.SelectedItem as Conversation)?.Guid;
         var draft = activeChat != null ? drafts.GetValueOrDefault(activeChat) : default;
         Composer.Text = draft.Text ?? ""; file = draft.File;
+        PendingPreview.Source = null;
         PendingFile.Text = file == null ? "" : "Attachment: " + Path.GetFileName(file);
+        if (file != null) SetAttachment(file);
         if (Chats.SelectedItem is not Conversation chat) { Messages.ItemsSource = null; return; }
-        ChatTitle.Text = chat.Name;
-        ChatSubtitle.Text = bridge == null ? "Demo conversation  |  no real messages are sent" : "BlueBubbles  |  synced with your Mac";
+        ChatTitle.Text = chat.Name; ChatAvatar.Text = chat.Initials;
+        ChatSubtitle.Text = bridge == null ? "Demo conversation" : chat.Service.Length > 0 ? chat.Service : "Service unknown";
         if (bridge == null) Messages.ItemsSource = demo.GetValueOrDefault(chat.Guid);
         else { Messages.ItemsSource = null; await LoadMessages(chat, generation); }
         MessageScroll.ScrollToEnd();
+        _ = Dispatcher.BeginInvoke(new Action(MarkViewed), DispatcherPriority.ContextIdle);
     }
     Message ParseMessage(JsonElement row)
     {
@@ -104,7 +143,10 @@ public partial class MainWindow : Window
         var attachments = row.Part("attachments").Rows().Select(a => new Attachment(a.Text("guid"), a.Text("transferName", "Attachment"), a.Text("mimeType"))).ToList();
         long Number(string key) => long.TryParse(row.Text(key), out var value) ? value : 0;
         var receipt = MessageBehavior.Receipt(mine, Number("error"), Number("dateRead"), Number("dateDelivered"), row.Text("isSent").Equals("true", StringComparison.OrdinalIgnoreCase));
-        return new(row.Text("text"), mine ? "You" : ContactName(row.Part("handle").Text("address", "Participant")), time, mine, attachments) { Receipt = receipt };
+                var id = row.Text("guid");
+        var retracted = locallyUnsent.Contains(id) || Number("dateRetracted") > 0;
+        return new(retracted ? "You unsent a message" : row.Text("text"), mine ? "You" : ContactName(row.Part("handle").Text("address", "Participant")), time, mine, retracted ? new() : attachments)
+        { Id = id, Created = Number("dateCreated"), Service = row.Text("service", row.Part("chats").Rows().FirstOrDefault().Text("guid").Split(';')[0] is { Length: > 0 } service ? service : (Chats.SelectedItem as Conversation)?.Service ?? ""), Sent = confirmedSent.Contains(id) || row.Text("isSent").Equals("true", StringComparison.OrdinalIgnoreCase) || Number("dateDelivered") > 0 || Number("dateRead") > 0, Retracted = retracted, SimplePart = Number("partCount") <= 1 && Number("itemType") == 0 && Number("associatedMessageType") == 0 && !row.Text("isSystemMessage").Equals("true", StringComparison.OrdinalIgnoreCase) && !row.Text("isServiceMessage").Equals("true", StringComparison.OrdinalIgnoreCase) && row.Text("associatedMessageGuid").Length == 0 && attachments.Count <= 1 && !(attachments.Count > 0 && row.Text("text").Length > 0) && (attachments.Count > 0 || row.Text("text").Length > 0), Receipt = retracted ? "" : receipt };
     }
     async Task LoadMessages(Conversation chat, int version)
     {
@@ -116,7 +158,11 @@ public partial class MainWindow : Window
             if (version != generation || current != bridge) return;
             var nearBottom = MessageScroll.ScrollableHeight - MessageScroll.VerticalOffset < 80;
             var ordered = rows.Rows().ToList();
-            Messages.ItemsSource = ordered.AsEnumerable().Reverse().Select(ParseMessage).ToList();
+            var messages = ordered.AsEnumerable().Reverse().Select(ParseMessage).ToList();
+            var lastOutgoing = messages.FindLastIndex(m => m.Mine);
+            for (int i = 0; i < messages.Count; i++) if (i != lastOutgoing && messages[i].Receipt != "Not Delivered") messages[i] = messages[i] with { Receipt = "" };
+            Messages.ItemsSource = messages;
+            _ = Dispatcher.BeginInvoke(new Action(MarkViewed), DispatcherPriority.ContextIdle);
             if (nearBottom) MessageScroll.ScrollToEnd();
 
         }
@@ -129,17 +175,21 @@ public partial class MainWindow : Window
         try
         {
             var current = bridge;
+            if (DateTimeOffset.UtcNow - capabilitiesChecked > TimeSpan.FromSeconds(30)) await CheckCapabilities();
             var rows = await current.Chats();
             if (current != bridge) return;
             conversations.Clear();
             foreach (var row in rows.Rows())
             {
                 var participants = string.Join(", ", row.Part("participants").Rows().Select(p => ContactName(p.Text("address"))));
+                var chatId = row.Text("guid"); var last = row.LastMessage();
+                latestTokens[chatId] = last.Text("guid");
+                var unread = MessageBehavior.IsUnread(last.Text("guid"), last.Text("isFromMe").Equals("true", StringComparison.OrdinalIgnoreCase), last.Text("isRead").Equals("true", StringComparison.OrdinalIgnoreCase), preferences.SeenMessages.GetValueOrDefault(chatId), preferences.ForcedUnread.Contains(chatId));
                 NotifyIncoming(row);
-                conversations.Add(new(row.Text("guid"), row.Text("displayName") is { Length: > 0 } name ? name : participants.Length > 0 ? participants : "Conversation", row.Part("lastMessage").Text("text", "Attachment or message"), preferences.Muted.Contains(row.Text("guid")), preferences.Pinned.Contains(row.Text("guid"))));
+                conversations.Add(new(row.Text("guid"), row.Text("displayName") is { Length: > 0 } name ? name : participants.Length > 0 ? participants : "Conversation", row.LastMessage().Text("text", "Attachment or message"), preferences.Muted.Contains(row.Text("guid")), preferences.Pinned.Contains(row.Text("guid")), unread, last.Text("service", row.Text("guid").Split(';')[0])));
             }
             // Avoid firing SelectionChanged on every poll when the conversation list has not changed.
-            var visible = conversations.Where(c => c.Name.Contains(Search.Text, StringComparison.OrdinalIgnoreCase) || c.Preview.Contains(Search.Text, StringComparison.OrdinalIgnoreCase)).OrderByDescending(c => preferences.Pinned.Contains(c.Guid)).ToList();
+            var visible = VisibleChats();
             if (Chats.ItemsSource is not List<Conversation> old || !old.SequenceEqual(visible)) Filter();
             notificationReady = true;
             if (Chats.SelectedItem is Conversation chat) await LoadMessages(chat, generation);
@@ -151,6 +201,7 @@ public partial class MainWindow : Window
     void ShowError(Exception ex) => Status.Text = ex is InvalidOperationException ? ex.Message : "Connection failed. Check that the server is running and reachable. Your draft has been kept.";
     void Attach_Click(object sender, RoutedEventArgs e)
     {
+        if (sending) return;
         var picker = new OpenFileDialog { Title = "Attach a photo or file" };
         if (picker.ShowDialog() == true) SetAttachment(picker.FileName);
     }
@@ -161,21 +212,24 @@ public partial class MainWindow : Window
     }
     async Task SendMessage()
     {
+        if (bridge != null && !privateApiReady) { Status.Text = "Sending requires a connected BlueBubbles Private API helper."; return; }
         if (sending || Chats.SelectedItem is not Conversation chat || (string.IsNullOrWhiteSpace(Composer.Text) && file == null)) return;
         sending = true; Send.IsEnabled = false; Composer.IsReadOnly = true; Chats.IsEnabled = false;
+        if (bridge != null && !chat.Service.Equals("iMessage", StringComparison.OrdinalIgnoreCase)) { sending = false; Send.IsEnabled = true; Composer.IsReadOnly = false; Chats.IsEnabled = true; Status.Text = "Live sending is currently verified for iMessage requests only. This service is not enabled."; return; }
         var text = Composer.Text; var attachment = file;
         try
         {
             if (bridge == null)
             {
-                demo[chat.Guid].Add(new(text, "You", DateTime.Now.ToString("h:mm tt") + "  |  demo", true, attachment == null ? new() : new() { new(attachment, Path.GetFileName(attachment)) }));
+                demo[chat.Guid].Add(new(text, "You", DateTime.Now.ToString("h:mm tt") + "  |  demo", true, attachment == null ? new() : new() { new(attachment, Path.GetFileName(attachment)) }) { Created = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), Sent = true });
+                latestTokens[chat.Guid] = "demo-" + demo[chat.Guid].Count;
                 Messages.ItemsSource = null; Messages.ItemsSource = demo[chat.Guid];
                 Composer.Clear(); file = null; PendingFile.Text = ""; PendingPreview.Source = null;
             }
             else
             {
                 // Clear each successful part independently so retry cannot duplicate a successful text.
-                if (!string.IsNullOrWhiteSpace(text)) { await bridge.Send(chat.Guid, text); Composer.Clear(); }
+                if (!string.IsNullOrWhiteSpace(text)) { var posted = await bridge.Send(chat.Guid, text); if (posted.Text("guid").Length > 0) confirmedSent.Add(posted.Text("guid")); Composer.Clear(); }
                 if (attachment != null) { await bridge.Upload(chat.Guid, attachment); file = null; PendingFile.Text = ""; PendingPreview.Source = null; }
                 await LoadMessages(chat, generation);
             }
@@ -187,20 +241,20 @@ public partial class MainWindow : Window
     async void Attachment_Click(object sender, RoutedEventArgs e)
     {
         if ((sender as Button)?.Tag is not Attachment attachment) return;
-        if (bridge == null) { Status.Text = "Demo attachment: " + attachment.Name; return; }
+
         var save = new SaveFileDialog { FileName = Path.GetFileName(attachment.Name), Title = "Save attachment" };
         if (save.ShowDialog() != true) return;
-        try { await bridge.Download(attachment.Guid, save.FileName); Status.Text = "Attachment saved."; }
+        try { if (bridge == null) File.Copy(attachment.Guid, save.FileName, true); else await bridge.Download(attachment.Guid, save.FileName); Status.Text = "Attachment saved."; }
         catch (Exception ex) { ShowError(ex); }
     }
     async void NewChat_Click(object sender, RoutedEventArgs e)
     {
-        if (bridge == null) { Status.Text = "Connect a server in settings to start a real conversation."; return; }
+
         var dialog = MakeDialog("New conversation", out var panel);
         AddLabel(panel, "Recipients  |  phone numbers or Apple emails, separated by commas"); var recipients = AddInput(panel, "");
         var contactSearch = AddInput(panel, ""); contactSearch.ToolTip = "Find a contact";
         var contacts = new ListBox { Height = 150, SelectionMode = SelectionMode.Extended, Background = Brushes.Transparent, BorderThickness = new Thickness(0) }; panel.Children.Add(contacts);
-        void FindContacts() => contacts.ItemsSource = contactNames.Select(c => new ContactChoice(c.Value, c.Key)).Where(c => c.ToString().Contains(contactSearch.Text, StringComparison.OrdinalIgnoreCase)).OrderBy(c => c.Name).ToList();
+        void FindContacts() => contacts.ItemsSource = contactNames.Select(c => new ContactChoice(c.Value, contactAddresses.GetValueOrDefault(c.Key, c.Key))).Where(c => c.ToString().Contains(contactSearch.Text, StringComparison.OrdinalIgnoreCase)).OrderBy(c => c.Name).ToList();
         contactSearch.TextChanged += (_, _) => FindContacts(); FindContacts();
         var add = new Button { Content = "Add selected recipients" }; panel.Children.Add(add);
         add.Click += (_, _) => recipients.Text = string.Join(", ", recipients.Text.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).Concat(contacts.SelectedItems.Cast<ContactChoice>().Select(c => c.Address)).Distinct(StringComparer.OrdinalIgnoreCase));
@@ -208,10 +262,21 @@ public partial class MainWindow : Window
         var send = new Button { Content = "Start conversation", Margin = new Thickness(0, 18, 0, 0) }; panel.Children.Add(send);
         send.Click += async (_, _) =>
         {
-            var addresses = recipients.Text.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+            var addresses = recipients.Text.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).DistinctBy(Normalize).ToArray();
             if (addresses.Length == 0 || string.IsNullOrWhiteSpace(message.Text)) return;
+            if (bridge != null && (!privateApiReady || (addresses.Length > 1 && serverMacMajor < 11))) { MessageBox.Show(dialog, "This server does not currently support creating this conversation. Check Private API and macOS version.", "Threadlet"); return; }
             send.IsEnabled = false;
-            try { await bridge.NewChat(addresses, message.Text); dialog.Close(); await Refresh(); }
+                        try
+            {
+                if (bridge == null)
+                {
+                    var guid = "demo-" + Guid.NewGuid(); var chat = new Conversation(guid, string.Join(", ", addresses.Select(ContactName)), message.Text);
+                    conversations.Insert(0, chat); demo[guid] = new() { new(message.Text, "You", DateTime.Now.ToString("h:mm tt"), true, new()) { Created = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), Sent = true } }; latestTokens[guid] = "demo-1";
+                    unreadOnly = false; Search.Clear(); Filter(); Chats.SelectedItem = Chats.Items.Cast<Conversation>().First(c => c.Guid == guid);
+                }
+                else { await bridge.NewChat(addresses, message.Text); await Refresh(); }
+                dialog.Close();
+            }
             catch (Exception ex) { ShowError(ex); MessageBox.Show(dialog, "Could not create the conversation. Check server connectivity and Private API support.", "Threadlet"); }
             finally { send.IsEnabled = true; }
         };
@@ -219,7 +284,7 @@ public partial class MainWindow : Window
     }
     async Task LoadContacts()
     {
-        contactNames.Clear();
+        contactNames.Clear(); contactAddresses.Clear();
         try
         {
             if (bridge == null) return;
@@ -231,7 +296,7 @@ public partial class MainWindow : Window
                 foreach (var entry in contact.Part("phoneNumbers").Rows().Concat(contact.Part("emails").Rows()))
                 {
                     var address = entry.ValueKind == JsonValueKind.String ? entry.GetString() ?? "" : entry.Text("address");
-                    if (address.Length > 0) contactNames[Normalize(address)] = name;
+                    if (address.Length > 0) { contactNames[Normalize(address)] = name; contactAddresses[Normalize(address)] = address; }
                 }
             }
             contactStatus = contactNames.Count == 0 ? "No contacts returned. Grant BlueBubbles Contacts permission on your Mac." : "Contacts loaded from your Mac.";
@@ -255,23 +320,20 @@ public partial class MainWindow : Window
     {
         if (sender is not Image image || image.DataContext is not Attachment attachment || !attachment.IsImage) return;
         var current = bridge;
-        if (current == null) return;
         await previewGate.WaitAsync();
         try
         {
             if (current != bridge) return;
             if (!previews.TryGetValue(attachment.Guid, out var bitmap))
             {
-                var bytes = await current.Preview(attachment.Guid);
+                var bytes = current == null ? await File.ReadAllBytesAsync(attachment.Guid) : await current.Preview(attachment.Guid);
                 using var memory = new MemoryStream(bytes);
-                bitmap = new System.Windows.Media.Imaging.BitmapImage();
-                bitmap.BeginInit(); bitmap.CacheOption = System.Windows.Media.Imaging.BitmapCacheOption.OnLoad; bitmap.DecodePixelWidth = 640; bitmap.StreamSource = memory; bitmap.EndInit(); bitmap.Freeze();
-                if (previews.Count >= 64) previews.Clear();
-                previews[attachment.Guid] = bitmap;
+                bitmap = new System.Windows.Media.Imaging.BitmapImage(); bitmap.BeginInit(); bitmap.CacheOption = System.Windows.Media.Imaging.BitmapCacheOption.OnLoad; bitmap.DecodePixelWidth = 640; bitmap.StreamSource = memory; bitmap.EndInit(); bitmap.Freeze();
+                if (previews.Count >= 64) previews.Clear(); previews[attachment.Guid] = bitmap;
             }
             if (current == bridge && Equals(image.DataContext, attachment)) image.Source = bitmap;
         }
-        catch { image.ToolTip = "Preview unavailable. Use Save attachment to download the file."; }
+        catch { if (image.Parent is Panel parent) foreach (var label in parent.Children.OfType<TextBlock>().Where(t => Equals(t.Tag, "PreviewFeedback"))) label.Visibility = Visibility.Visible; image.MinHeight = 48; image.ToolTip = "Preview unavailable. HEIC needs a Windows codec locally or a connected Mac converter. Click to retry."; }
         finally { previewGate.Release(); }
     }
     void SetAttachment(string path)
@@ -320,7 +382,7 @@ public partial class MainWindow : Window
     }
     void NotifyIncoming(JsonElement row)
     {
-        var chatGuid = row.Text("guid"); var last = row.Part("lastMessage"); var messageGuid = last.Text("guid");
+        var chatGuid = row.Text("guid"); var last = row.LastMessage(); var messageGuid = last.Text("guid");
         if (messageGuid.Length == 0 || chatGuid.Length == 0) return;
         var first = !notificationBaseline.TryGetValue(chatGuid, out var previous);
         notificationBaseline[chatGuid] = messageGuid;
@@ -387,9 +449,93 @@ public partial class MainWindow : Window
         if ((sender as MenuItem)?.DataContext is Message message && !string.IsNullOrEmpty(message.Text))
             try { Clipboard.SetText(message.Text); } catch { Status.Text = "Clipboard is busy. Try again."; }
     }
+    void MarkViewed()
+    {
+        if (updatingList || !IsActive || !IsEnabled || WindowState == WindowState.Minimized || MessageScroll.ScrollableHeight - MessageScroll.VerticalOffset > 40 || Chats.SelectedItem is not Conversation chat || !chat.Unread || Messages.ItemsSource == null) return;
+        if (latestTokens.TryGetValue(chat.Guid, out var token)) preferences.SeenMessages[chat.Guid] = token;
+        preferences.ForcedUnread.Remove(chat.Guid);
+        var index = conversations.FindIndex(c => c.Guid == chat.Guid);
+        if (index >= 0) conversations[index] = conversations[index] with { Unread = false };
+        SavePreferences(); Filter();
+    }
+    void ChatRead_Click(object sender, RoutedEventArgs e)
+    {
+        if ((sender as MenuItem)?.DataContext is not Conversation chat) return;
+        var index = conversations.FindIndex(c => c.Guid == chat.Guid); if (index < 0) return;
+        if (chat.Unread) { preferences.ForcedUnread.Remove(chat.Guid); preferences.SeenMessages[chat.Guid] = latestTokens.GetValueOrDefault(chat.Guid, ""); }
+        else { preferences.ForcedUnread.Add(chat.Guid); if ((Chats.SelectedItem as Conversation)?.Guid == chat.Guid) Chats.SelectedItem = null; }
+        conversations[index] = chat with { Unread = !chat.Unread }; SavePreferences(); Filter();
+    }
+    async Task CheckCapabilities()
+    {
+        capabilitiesChecked = DateTimeOffset.UtcNow; supportsUnsend = false; privateApiReady = false; serverMacMajor = 0;
+        try
+        {
+            if (bridge == null) return;
+            var info = await bridge.ServerInfo();
+            privateApiReady = info.Text("private_api").Equals("true", StringComparison.OrdinalIgnoreCase) && info.Text("helper_connected").Equals("true", StringComparison.OrdinalIgnoreCase);
+            int.TryParse(info.Text("os_version").Split('.')[0], out serverMacMajor); supportsUnsend = privateApiReady && serverMacMajor >= 13;
+        }
+        catch { /* Unknown capabilities keep advanced actions hidden. */ }
+    }
+    bool CanUnsend(Message message) => MessageBehavior.CanUnsend(message.Mine, message.Service, message.Sent, message.Created, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), bridge == null || (supportsUnsend && DateTimeOffset.UtcNow - capabilitiesChecked < TimeSpan.FromSeconds(40)), message.Retracted, message.SimplePart) && message.Id.Length > 0;
+    void MessageMenu_Opened(object sender, RoutedEventArgs e)
+    {
+        if (sender is not ContextMenu menu || menu.DataContext is not Message message) return;
+        menu.Items.Clear();
+        var copy = new MenuItem { Header = "Copy", DataContext = message, IsEnabled = !string.IsNullOrEmpty(message.Text) }; copy.Click += CopyMessage_Click; menu.Items.Add(copy);
+        var undo = new MenuItem { Header = "Undo Send", DataContext = message };
+        void Update() => undo.Visibility = CanUnsend(message) ? Visibility.Visible : Visibility.Collapsed;
+        Update(); menu.Items.Add(undo);
+        var expiry = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) };
+        expiry.Tick += (_, _) => Update(); expiry.Start(); RoutedEventHandler? closed = null; closed = (_, _) => { expiry.Stop(); menu.Closed -= closed; }; menu.Closed += closed;
+        undo.Click += async (_, _) =>
+        {
+            if (!CanUnsend(message) || sending) { Status.Text = "Undo Send is no longer available for this message."; return; }
+            var current = bridge; var chat = Chats.SelectedItem as Conversation;
+            if (chat == null) return;
+            sending = true;
+            try
+            {
+                if (current == null)
+                {
+                    var messages = demo[chat.Guid]; var index = messages.FindIndex(m => m.Id == message.Id);
+                    if (index >= 0) messages[index] = message with { Text = "You unsent a message", Attachments = new(), Retracted = true, Receipt = "" };
+                    Messages.ItemsSource = null; Messages.ItemsSource = messages;
+                }
+                else
+                {
+                    await current.Unsend(message.Id);
+                    locallyUnsent.Add(message.Id);
+                    if (current == bridge && (Chats.SelectedItem as Conversation)?.Guid == chat.Guid) await LoadMessages(chat, generation);
+                }
+                Status.Text = "Message unsent. Recipients on older Apple software may retain the original.";
+            }
+            catch { Status.Text = "Undo Send failed or its time limit expired. The message has not been removed locally."; }
+            finally { sending = false; }
+        };
+    }
+    async Task StartVm()
+    {
+        if (vmStarting) return;
+        VmLauncher.ImportLegacy(preferences);
+        vmStarting = true; VmStatus.Text = "Checking background VM...";
+        try { VmStatus.Text = await VmLauncher.Start(preferences); }
+        finally { vmStarting = false; }
+    }
     void Settings_Click(object sender, RoutedEventArgs e)
     {
-        var dialog = MakeDialog("Connect Threadlet", out var panel);
+        var dialog = MakeDialog("Threadlet Settings", out var panel);
+        AddLabel(panel, "Background macOS VM");
+        var auto = new CheckBox { Content = "Start my existing VMware VM when Threadlet opens", IsChecked = preferences.AutoStartVm, Foreground = Brushes.White, Margin = new Thickness(0, 12, 0, 6) };
+        auto.Checked += (_, _) => { preferences.AutoStartVm = true; SavePreferences(); }; auto.Unchecked += (_, _) => { preferences.AutoStartVm = false; SavePreferences(); }; panel.Children.Add(auto);
+        var vmPath = new TextBlock { Text = string.IsNullOrEmpty(preferences.VmxPath) ? "No VM configured. macOS must be installed separately." : preferences.VmxPath, TextWrapping = TextWrapping.Wrap }; panel.Children.Add(vmPath);
+        var chooseVm = new Button { Content = "Choose existing .vmx file" }; panel.Children.Add(chooseVm);
+        chooseVm.Click += (_, _) => { var picker = new OpenFileDialog { Filter = "VMware virtual machine (*.vmx)|*.vmx" }; if (picker.ShowDialog() == true) { preferences.VmxPath = picker.FileName; vmPath.Text = picker.FileName; SavePreferences(); } };
+        var chooseRunner = new Button { Content = "Choose VMware vmrun.exe" }; panel.Children.Add(chooseRunner);
+        chooseRunner.Click += (_, _) => { var picker = new OpenFileDialog { Filter = "VMware vmrun (vmrun.exe)|vmrun.exe" }; if (picker.ShowDialog() == true) { preferences.VmrunPath = picker.FileName; SavePreferences(); } };
+        var startVm = new Button { Content = "Start VM in background" }; panel.Children.Add(startVm);
+        startVm.Click += async (_, _) => { startVm.IsEnabled = false; await StartVm(); vmPath.Text = VmStatus.Text; startVm.IsEnabled = true; };
         AddLabel(panel, "Your messages. Your server.");
         var enabled = new CheckBox { Content = "Desktop notifications", IsChecked = notificationsEnabled, Foreground = Brushes.White, Margin = new Thickness(0, 10, 0, 10) };
         enabled.Checked += (_, _) => notificationsEnabled = true; enabled.Unchecked += (_, _) => notificationsEnabled = false; panel.Children.Add(enabled);
@@ -407,15 +553,15 @@ public partial class MainWindow : Window
             try
             {
                 candidate = new Bridge(url.Text, password.Password); await candidate.Ping();
-                timer.Stop(); generation++; bridge?.Dispose(); bridge = candidate; candidate = null; serverUrl = url.Text;
-                previews.Clear(); notificationBaseline.Clear(); notificationReady = false; drafts.Clear(); activeChat = null; Composer.Clear(); file = null; PendingFile.Text = ""; PendingPreview.Source = null; conversations.Clear(); Chats.ItemsSource = null; Messages.ItemsSource = null;
+                timer.Stop(); generation++; supportsUnsend = false; capabilitiesChecked = default; bridge?.Dispose(); bridge = candidate; candidate = null; serverUrl = url.Text;
+                previews.Clear(); notificationBaseline.Clear(); latestTokens.Clear(); locallyUnsent.Clear(); confirmedSent.Clear(); notificationReady = false; drafts.Clear(); activeChat = null; Composer.Clear(); file = null; PendingFile.Text = ""; PendingPreview.Source = null; conversations.Clear(); Chats.ItemsSource = null; Messages.ItemsSource = null;
                 Connection.Text = "? Connected to your BlueBubbles server"; dialog.Close();
-                await LoadContacts(); await Refresh(); if (Chats.Items.Count > 0) Chats.SelectedIndex = 0; timer.Start();
+                await CheckCapabilities(); await LoadContacts(); await Refresh(); if (Chats.Items.Count > 0) Chats.SelectedIndex = 0; timer.Start();
             }
             catch { feedback.Text = "Could not connect. Use HTTPS (or localhost HTTP) and check your URL, password, and server."; }
             finally { candidate?.Dispose(); connect.IsEnabled = true; }
         };
-        AddLabel(panel, "VM startup is optional. The launcher reads vm-config.cmd; configure an existing VMware VM there. Threadlet does not install macOS or sign into Apple for you.");
+        AddLabel(panel, "Threadlet can start an existing VM without its console, but does not install macOS or sign into Apple for you.");
         dialog.ShowDialog();
     }
 }
