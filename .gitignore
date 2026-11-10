@@ -1,0 +1,7 @@
+**/bin/
+**/obj/
+.vs/
+vm-config.cmd
+
+downloads/
+artifacts/
