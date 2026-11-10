@@ -1,40 +1,41 @@
-# Threadlet
-A Windows messaging app powered by BlueBubbles, bringing iMessage conversations, group chats, and photo sharing to your desktop through a macOS bridge running in the background.
+﻿# Threadlet
 
-this is currently under construction; it doesn't work yet!
-## Run on Windows
+A native Windows messaging client for your own BlueBubbles server. Under construction: the app runs in demo mode, but live messaging still requires a configured Mac/macOS server and end-to-end validation.
 
-Use the **Threadlet desktop shortcut** or double-click **Open-Threadlet.vbs** for the packaged app without a terminal. For rebuilding from source, double-click **Start-Threadlet.bat** in this folder. It builds the Release version and opens the app. The first build needs the .NET 8 SDK; Install-DotNet.bat installs it through Microsoft's winget package.
+## Open the app
 
-Alternatively:
+Use the **Threadlet desktop shortcut** or **Open-Threadlet.vbs** to open the packaged app without a terminal. The package lives in artifacts/app. To rebuild from source, run **Start-Threadlet.bat** or:
 
 ```powershell
 dotnet run --project Threadlet/Threadlet.csproj --configuration Release
 ```
 
-## Current implementation
+The .NET 8 SDK is needed for source builds. Install-DotNet.bat installs it through winget.
 
-- Native C# / WPF interface with a dark theme, searchable conversation sidebar, message bubbles, and a multiline composer.
-- Clearly labeled local demo conversations; demo messages never reach Apple or a server.
-- BlueBubbles server connection with in-memory credentials, conversation polling every five seconds, and the latest 100 messages in each chat.
-- Text sending, group-conversation creation, attachment upload, and attachment saving through the BlueBubbles REST API. Sending and group creation require compatible Private API support.
-- HTTPS server connections, with plain HTTP allowed only for localhost. Use a trusted HTTPS endpoint for remote servers.
-- Optional headless VMware startup: copy vm-config.example.cmd to vm-config.cmd and configure paths to an existing VM. The launcher never shuts down an existing VM.
+## Features
+
+- Native WPF interface, blue outgoing bubbles, contact names, conversation search and per-conversation drafts.
+- New individual/group conversations with a searchable contact picker and multiple recipients.
+- Text sending, photo/file upload, drag/drop attachments, and removable attachment previews.
+- Inline photos, a click-to-open photo viewer with zoom, and saving original attachments. HEIC/HEIF viewing uses BlueBubbles conversion; sending and saving preserve the original format.
+- Recipient Delivered/Read status with read timestamps when reported by the server. Threadlet does not send mark-read requests or enable your read receipts.
+- Desktop notifications while running, with private previews by default. Right-click a chat for **Hide Alerts** or **Pin**. Settings are saved between launches; pins and mutes apply only to Threadlet.
+- Conversation **Info** with Hide Alerts and shared attachments from the loaded messages.
 
 ## Connect
 
-Open **Connection & launch settings**, enter your BlueBubbles URL and password, and connect. The Mac or macOS VM must already run BlueBubbles with Messages signed in. Credentials are intentionally not saved to disk; reconnect when opening the app.
+Open Connection & launch settings and enter your BlueBubbles URL and password. Use HTTPS for remote servers; HTTP is allowed only on localhost. Credentials are kept in memory, so reconnect after restarting. The Mac needs Messages signed in and Contacts permission; sending and group creation use compatible Private API support.
 
-## Limits and validation
+The official Intel macOS BlueBubbles installer is in downloads. No VM or macOS image has been installed. If you already have a working VMware VM, copy vm-config.example.cmd to vm-config.cmd and set its paths. The terminal-free launcher can start that VM with nogui. Initial macOS installation and Apple sign-in require interaction.
 
-This is an initial client, not a complete replacement for Apple Messages. Live API operations still need testing against your BlueBubbles server. There is no VM image, automatic Apple sign-in, reaction support, typing indicator, older-message pagination, persistent message cache, or Windows toast integration yet. Images show inline previews when the server can convert them; attachment buttons save files. Delivery/read labels reflect actual server timestamps, and Mark current conversation read explicitly marks the selected chat. Contacts can be browsed and are used for conversation names when the Mac grants access. SMS/RCS support is not promised. Only the latest 100 conversations and messages are loaded.
+## Verification and limitations
 
-The UI can be explored without any server or VM. No BlueBubbles source is bundled; the client communicates with your own server over HTTP.
+```powershell
+dotnet run --project tests/BridgeChecks/BridgeChecks.csproj
+```
 
-API reference: https://docs.bluebubbles.app/server/developer-guides/rest-api-and-webhooks
+Mock-server checks validate client requests, photo conversion/original-download modes, recipient read-status presentation, and notification suppression. They do not prove Apple delivery, real HEIC conversion, or Windows notification display.
 
-## Verification
+Polling runs every five seconds and loads at most 100 conversations and the latest 100 messages in each. Full-history search, reactions, inline replies, editing/unsending, audio recording, typing indicators, and Apple ecosystem features are not implemented. SMS/RCS compatibility is not promised. Windows notification settings can suppress desktop alerts. Read receipts can still be sent independently by your other Apple devices.
 
-Local mock-server checks cover authentication, contacts, querying and sending messages, multipart photo upload, preview downloads, attachment saving, and mark-read requests. Run: dotnet run --project tests/BridgeChecks/BridgeChecks.csproj. These checks validate client requests, not Apple delivery or server compatibility.
-
-The packaged app lives in artifacts/app. The desktop shortcut uses Open-Threadlet.vbs so no terminal window appears. If vm-config.cmd exists, Start-VM.cmd starts the configured existing VMware VM with nogui. macOS setup and Apple sign-in still need to be completed interactively. No VM software or macOS image is included.
+See [MESSAGES-REFERENCE.md](MESSAGES-REFERENCE.md) for the Apple documentation review and feature comparison. No BlueBubbles source is bundled; this app communicates with your server through its REST API.

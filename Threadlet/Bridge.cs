@@ -28,7 +28,6 @@ public sealed class Bridge : IDisposable
     public async Task Ping() => await Read(await client.GetAsync(Url("ping")));
     public async Task<JsonElement> Chats() => await Post("chat/query", new { limit = 100, offset = 0, with = new[] { "participants", "lastMessage" }, sort = "lastmessage" });
     public async Task<JsonElement> Messages(string guid, int offset = 0) => await Post("message/query", new { chatGuid = guid, limit = 100, offset, sort = "DESC", with = new[] { "handle", "attachment" } });
-    public async Task MarkRead(string guid) => await Post("chat/" + Uri.EscapeDataString(guid) + "/read", new { });
     public async Task Send(string guid, string text) => await Post("message/text", new { chatGuid = guid, message = text, tempGuid = Guid.NewGuid().ToString(), method = "private-api" });
     public async Task NewChat(string[] addresses, string text) => await Post("chat/new", new { addresses, message = text, method = "private-api" });
     public async Task Upload(string guid, string path)
@@ -42,14 +41,14 @@ public sealed class Bridge : IDisposable
     }
     public async Task Download(string guid, string path)
     {
-        using var response = await client.GetAsync(Url("attachment/" + Uri.EscapeDataString(guid) + "/download"));
+        using var response = await client.GetAsync(Url("attachment/" + Uri.EscapeDataString(guid) + "/download?original=true"));
         if (!response.IsSuccessStatusCode) throw new InvalidOperationException("The attachment could not be downloaded.");
         await using var output = File.Create(path);
         await response.Content.CopyToAsync(output);
     }
-        public async Task<byte[]> Preview(string guid)
+        public async Task<byte[]> Preview(string guid, bool large = false)
     {
-        using var response = await client.GetAsync(Url("attachment/" + Uri.EscapeDataString(guid) + "/download?width=640&height=480"), HttpCompletionOption.ResponseHeadersRead);
+        using var response = await client.GetAsync(Url("attachment/" + Uri.EscapeDataString(guid) + (large ? "/download?original=false&width=2048&quality=best" : "/download?original=false&width=640&quality=good")), HttpCompletionOption.ResponseHeadersRead);
         if (!response.IsSuccessStatusCode) throw new InvalidOperationException("Preview unavailable");
         const int maximum = 12 * 1024 * 1024;
         if (response.Content.Headers.ContentLength > maximum) throw new InvalidOperationException("Preview too large");
