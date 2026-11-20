@@ -5,3 +5,6 @@ vm-config.cmd
 
 downloads/
 artifacts/
+backend/tools/
+backend/recovery/
+backend/vm/

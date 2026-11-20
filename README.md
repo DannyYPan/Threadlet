@@ -26,9 +26,68 @@ The .NET 8 SDK is needed for source builds. Install-DotNet.bat installs it throu
 
 ## Connect
 
-Open Connection & launch settings and enter your BlueBubbles URL and password. Use HTTPS for remote servers; HTTP is allowed only on localhost. Credentials are kept in memory, so reconnect after restarting. The Mac needs Messages signed in and Contacts permission; sending and group creation use compatible Private API support.
+Open Settings and enter your BlueBubbles URL and password. Use HTTPS for remote servers; HTTP is allowed only on localhost. Credentials are kept in memory, so reconnect after restarting. The Mac needs Messages signed in and Contacts permission; sending and group creation use compatible Private API support.
 
-The official Intel macOS BlueBubbles installer is in downloads. No VM or macOS image has been installed. If you already have a working VMware VM, choose its .vmx file and vmrun.exe in Settings and enable automatic startup. Threadlet starts it with nogui from every app entry point. Existing vm-config.cmd paths can also be imported. Initial macOS installation and Apple sign-in require interaction.
+## macOS VM and BlueBubbles setup
+
+The planned backend is:
+
+**Threadlet on Windows -> BlueBubbles server -> Messages inside a macOS VM**
+
+VMware runs the virtual computer. **OC4VM (OpenCore for VMware)** supplies the boot image and VM templates that help macOS run without patching VMware's program files. OC4VM does not include macOS or guarantee iMessage activation.
+
+### Current progress - November 10, 2026
+
+- PC virtualization is enabled; the host has about 16 GB RAM and sufficient free disk space.
+- QEMU's disk-image tools are installed.
+- A macOS recovery image has been downloaded from Apple's servers and verified using the upstream recovery utility.
+- OC4VM 3.0.1 has been downloaded, checksum-verified, and extracted.
+- The official Intel macOS BlueBubbles 1.9.12 installer has been downloaded and verified.
+- **VMware Workstation Pro 25H2u1 for Windows is currently being downloaded by the user.** Installation has not yet been confirmed.
+- The macOS VM has not been created or booted. Messages sign-in, BlueBubbles configuration, and live Threadlet messaging are still pending.
+
+### Install locations
+
+1. Install **VMware Workstation Pro 25H2u1 for Windows** using the installer's default application folder.
+2. Store the actual macOS VM files here:
+
+   ~~~text
+   C:\Users\danny\Virtual Machines\Threadlet
+   ~~~
+
+   This keeps the large, frequently changing virtual disks outside OneDrive and the source repository.
+
+3. Downloaded setup assets are currently in the repository:
+
+   | Asset | Location |
+   | --- | --- |
+   | BlueBubbles server installer | downloads/BlueBubbles-1.9.12.dmg |
+   | Apple recovery image and verification data | backend/recovery/ |
+   | Verified OC4VM package and templates | backend/tools/oc4vm-3.0.1/ |
+   | Upstream macOS recovery utility | backend/tools/OpenCore-1.0.8/Utilities/macrecovery/ |
+
+These download/tool directories are excluded from Git.
+
+### Remaining setup
+
+1. Finish downloading and installing VMware.
+2. Prepare the Intel OC4VM template and attach the verified recovery image.
+3. Boot the VM and install macOS.
+4. Complete macOS setup and sign into Messages with your Apple Account. Sign-in and two-factor authentication require your interaction.
+5. Install BlueBubbles inside macOS and grant its required permissions. Configure the compatible Private API helper for advanced messaging.
+6. Verify the Windows-to-guest connection and server URL before connecting Threadlet. The current client allows HTTP only on localhost; direct HTTP to a VM's private IP is not yet supported. That networking step must be resolved during integration.
+7. In Threadlet **Settings**, choose the VM's .vmx file and VMware's vmrun.exe, then enable automatic startup. Existing vm-config.cmd paths can also be imported.
+8. Verify real text/photo delivery, recipient receipts, Undo Send, and background startup.
+
+After configuration, Threadlet can start the existing VM with nogui from the desktop shortcut, direct executable, or source launcher. The initial installation and account setup remain interactive. Passwords are currently kept in memory, so server reconnection after restarting is still manual.
+
+### Setup references
+
+- [BlueBubbles: VMware on Windows guide](https://github.com/BlueBubblesApp/bluebubbles-docs/blob/master/server/advanced/macos-virtualization/running-a-macos-vm/deploying-macos-in-vmware-on-windows-full-guide.md)
+- [OC4VM documentation and tested VMware versions](https://github.com/DrDonk/OC4VM/blob/main/readme.md)
+- [Official VMware download instructions](https://knowledge.broadcom.com/external/article/368734)
+
+The BlueBubbles guide includes older VMware 15/16 and unlocker instructions. Our prepared approach uses OC4VM; version-specific instructions must be checked during setup.
 
 ## Verification and limitations
 
